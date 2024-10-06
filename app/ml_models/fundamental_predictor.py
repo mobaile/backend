@@ -7,8 +7,8 @@ from xgboost import XGBClassifier
 from sklearn.metrics import precision_score, recall_score, f1_score, roc_auc_score, accuracy_score
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
-from keras.models import Sequential
-from keras.layers import LSTM, Dense, Conv1D, Dropout, BatchNormalization, MaxPooling1D, Bidirectional
+from keras.models import Sequential, Model
+from keras.layers import Input, Multiply, Reshape, LSTM, Dense, Conv1D, Dropout, BatchNormalization, GlobalAveragePooling1D, MaxPooling1D, Bidirectional
 from keras.optimizers import Adam
 from keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
 from keras.models import load_model
@@ -31,39 +31,47 @@ import time
 
 class FundamentalPredictor:
     def __init__(self):
-        self.model = self.build_model()
         self.scaler = MinMaxScaler()
+        self.model = self.build_model()
 
     def build_model(self):
         clear_session()
-        model = Sequential()
         
-        model.add(Dense(1000, activation='relu', kernel_regularizer=regularizers.l2(0.01)))
-        model.add(Dropout(0.2))
-        model.add(BatchNormalization())
-
-        model.add(Dense(2000, activation='relu', kernel_regularizer=regularizers.l2(0.01)))
-        model.add(Dropout(0.2))
-        model.add(BatchNormalization())
-
-        model.add(Dense(3000, activation='relu', kernel_regularizer=regularizers.l2(0.01)))
-        model.add(Dropout(0.2))
-        model.add(BatchNormalization())
-
-        model.add(Dense(2000, activation='relu', kernel_regularizer=regularizers.l2(0.01)))
-        model.add(Dropout(0.2))
-        model.add(BatchNormalization())
-
-        model.add(Dense(1000, activation='relu', kernel_regularizer=regularizers.l2(0.01)))
-        model.add(Dropout(0.2))
-        model.add(BatchNormalization())
-        model.add(Dense(500, activation='relu', kernel_regularizer=regularizers.l2(0.01)))
-
-        # Output layer for binary classification
-        model.add(Dense(1, activation='sigmoid'))
-
-        # Optimizer with a lower learning rate and scheduler
-        optimizer = Adam(learning_rate=0.1)
+        # Input layer
+        inputs = Input(shape=(2139,))
+        
+        # First dense layer
+        x = Dense(1024, activation='relu', kernel_regularizer=regularizers.l2(0.01))(inputs)
+        x = Dropout(0.3)(x)
+        x = BatchNormalization()(x)
+        
+        # Additional dense layers
+        for units in [512,256, 256]:
+            x = Dense(units, activation='relu', kernel_regularizer=regularizers.l2(0.01))(x)
+            x = Dropout(0.2)(x)
+            x = BatchNormalization()(x)
+        
+        # Reshape for attention mechanism
+        x = Reshape((256, 1))(x)
+        
+        # Attention mechanism
+        attention = Dense(256, activation='relu')(x)
+        attention = Dense(1, activation='softmax')(attention)
+        
+        # Apply attention
+        x = Multiply()([x, attention])
+        
+        # Global average pooling
+        x = GlobalAveragePooling1D()(x)
+        
+        # Output layer
+        outputs = Dense(1, activation='sigmoid')(x)
+        
+        # Create the model
+        model = Model(inputs=inputs, outputs=outputs)
+        
+        # Optimizer with a lower learning rate
+        optimizer = Adam(learning_rate=0.1, clipnorm = 1.0)
         
         # Compile the model
         model.compile(optimizer=optimizer, loss='binary_crossentropy', metrics=['accuracy'])
@@ -87,10 +95,10 @@ class FundamentalPredictor:
         checkpoint = ModelCheckpoint('ml_models/weights/fundamental_weights/weights.keras', 
                                       save_best_only=True, save_freq = 1,
                                       monitor='val_loss', mode='min')
-        early_stopping = EarlyStopping(monitor='val_loss', patience=20, restore_best_weights=True)
-        reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=10, min_lr=0.00001)
+        early_stopping = EarlyStopping(monitor='val_loss', patience=70, restore_best_weights=True)
+        reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=60, min_lr=0.00001)
 
-        self.model.fit(X_train, y_train, epochs=100_000, batch_size=64, 
+        self.model.fit(X_train, y_train, epochs=100_000, batch_size=32, 
                        validation_split=0.1, callbacks=[checkpoint, early_stopping, reduce_lr])
         self.model.save('ml_models/weights/fundamental_weights/weights.keras')
 

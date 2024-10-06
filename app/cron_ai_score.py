@@ -4,7 +4,7 @@ import aiohttp
 import aiofiles
 import sqlite3
 from datetime import datetime
-from ml_models.fundamental_predictor import FundamentalPredictor
+from ml_models.score_model import ScorePredictor
 import yfinance as yf
 from collections import defaultdict
 import pandas as pd
@@ -22,7 +22,7 @@ import gc
 gc.enable()
 
 async def save_json(symbol, data):
-    with open(f"json/fundamental-predictor-analysis/{symbol}.json", 'wb') as file:
+    with open(f"json/ai-score/companies/{symbol}.json", 'wb') as file:
         file.write(orjson.dumps(data))
 
 
@@ -31,11 +31,6 @@ def trend_intensity(close, window=20):
     std = close.rolling(window=window).std()
     return ((close - ma) / std).abs().rolling(window=window).mean()
 
-def fisher_transform(high, low, window=10):
-    value = (high + low) / 2
-    norm_value = (2 * ((value - value.rolling(window=window).min()) / 
-                       (value.rolling(window=window).max() - value.rolling(window=window).min())) - 1)
-    return 0.5 * np.log((1 + norm_value) / (1 - norm_value))
 
 def calculate_fdi(high, low, close, window=30):
     n1 = (np.log(high.rolling(window=window).max() - low.rolling(window=window).min()) -
@@ -43,24 +38,20 @@ def calculate_fdi(high, low, close, window=30):
     return (2 - n1) * 100
 
 
-def hurst_exponent(ts, max_lag=100):
-    lags = range(2, max_lag)
-    tau = [np.sqrt(np.std(np.subtract(ts[lag:], ts[:-lag]))) for lag in lags]
-    poly = np.polyfit(np.log(lags), np.log(tau), 1)
-    return poly[0] * 2.0
+
 
 async def download_data(ticker, con, start_date, end_date):
     try:
         # Define paths to the statement files
         statements = [
             f"json/financial-statements/ratios/quarter/{ticker}.json",
+            f"json/financial-statements/key-metrics/quarter/{ticker}.json",
             f"json/financial-statements/cash-flow-statement/quarter/{ticker}.json",
             f"json/financial-statements/income-statement/quarter/{ticker}.json",
             f"json/financial-statements/balance-sheet-statement/quarter/{ticker}.json",
             f"json/financial-statements/income-statement-growth/quarter/{ticker}.json",
             f"json/financial-statements/balance-sheet-statement-growth/quarter/{ticker}.json",
             f"json/financial-statements/cash-flow-statement-growth/quarter/{ticker}.json",
-            f"json/financial-statements/key-metrics/quarter/{ticker}.json",
             f"json/financial-statements/owner-earnings/quarter/{ticker}.json",
         ]
 
@@ -81,28 +72,33 @@ async def download_data(ticker, con, start_date, end_date):
 
         ratios = await load_json_from_file(statements[0])
         ratios = await filter_data(ratios, ignore_keys)
+
+        #Threshold of enough datapoints needed!
+        if len(ratios) < 50:
+            return
+
+        key_metrics = await load_json_from_file(statements[1])
+        key_metrics = await filter_data(key_metrics, ignore_keys)
         
-        cashflow = await load_json_from_file(statements[1])
+        
+        cashflow = await load_json_from_file(statements[2])
         cashflow = await filter_data(cashflow, ignore_keys)
 
-        income = await load_json_from_file(statements[2])
+        income = await load_json_from_file(statements[3])
         income = await filter_data(income, ignore_keys)
 
-        balance = await load_json_from_file(statements[3])
+        balance = await load_json_from_file(statements[4])
         balance = await filter_data(balance, ignore_keys)
-
-        income_growth = await load_json_from_file(statements[4])
+        
+        income_growth = await load_json_from_file(statements[5])
         income_growth = await filter_data(income_growth, ignore_keys)
 
-        balance_growth = await load_json_from_file(statements[5])
+        balance_growth = await load_json_from_file(statements[6])
         balance_growth = await filter_data(balance_growth, ignore_keys)
 
 
-        cashflow_growth = await load_json_from_file(statements[6])
+        cashflow_growth = await load_json_from_file(statements[7])
         cashflow_growth = await filter_data(cashflow_growth, ignore_keys)
-
-        key_metrics = await load_json_from_file(statements[7])
-        key_metrics = await filter_data(key_metrics, ignore_keys)
 
         owner_earnings = await load_json_from_file(statements[8])
         owner_earnings = await filter_data(owner_earnings, ignore_keys)
@@ -112,7 +108,7 @@ async def download_data(ticker, con, start_date, end_date):
         combined_data = defaultdict(dict)
 
         # Merge the data based on 'date'
-        for entries in zip(income, income_growth, balance, balance_growth, cashflow, cashflow_growth, ratios, key_metrics, owner_earnings):
+        for entries in zip(ratios,key_metrics,income, balance, cashflow, owner_earnings, income_growth, balance_growth, cashflow_growth):
             for entry in entries:
                 date = entry['date']
                 for key, value in entry.items():
@@ -120,8 +116,6 @@ async def download_data(ticker, con, start_date, end_date):
                         combined_data[date][key] = value
 
         combined_data = list(combined_data.values())
-        #Generate more features
-        #combined_data = calculate_combinations(combined_data)
 
         # Download historical stock data using yfinance
         df = yf.download(ticker, start=start_date, end=end_date, interval="1d").reset_index()
@@ -147,8 +141,8 @@ async def download_data(ticker, con, start_date, end_date):
         df['daily_return'] = df['close'].pct_change()
         df['cumulative_return'] = (1 + df['daily_return']).cumprod() - 1
         df['volume_change'] = df['volume'].pct_change()
-        df['roc'] = df['close'].pct_change(periods=30) * 100  # 12-day ROC
-        df['avg_volume_30d'] = df['volume'].rolling(window=30).mean()
+        df['roc'] = df['close'].pct_change(periods=60)
+        df['avg_volume'] = df['volume'].rolling(window=60).mean()
         df['drawdown'] = df['close'] / df['close'].rolling(window=252).max() - 1
 
 
@@ -165,9 +159,9 @@ async def download_data(ticker, con, start_date, end_date):
         df['obv'] = OnBalanceVolumeIndicator(close=df['close'], volume=df['volume']).on_balance_volume()
         df['vpt'] = VolumePriceTrendIndicator(close=df['close'], volume=df['volume']).volume_price_trend()
         
-        df['rsi'] = rsi(df["close"], window=30)
+        df['rsi'] = rsi(df["close"], window=60)
         df['rolling_rsi'] = df['rsi'].rolling(window=10).mean()
-        df['stoch_rsi'] = stochrsi_k(df['close'], window=30, smooth1=3, smooth2=3)
+        df['stoch_rsi'] = stochrsi_k(df['close'], window=60, smooth1=3, smooth2=3)
         df['rolling_stoch_rsi'] = df['stoch_rsi'].rolling(window=10).mean()
 
         df['adi'] = acc_dist_index(high=df['high'],low=df['low'],close=df['close'],volume=df['volume'])
@@ -185,8 +179,6 @@ async def download_data(ticker, con, start_date, end_date):
         df['volatility_ratio'] = df['close'].rolling(window=30).std() / df['close'].rolling(window=60).std()
 
         df['fdi'] = calculate_fdi(df['high'], df['low'], df['close'])
-        #df['hurst'] = df['close'].rolling(window=100).apply(hurst_exponent)
-        df['fisher'] = fisher_transform(df['high'], df['low'])
         df['tii'] = trend_intensity(df['close'])
 
 
@@ -194,9 +186,10 @@ async def download_data(ticker, con, start_date, end_date):
             'rsi', 'macd', 'macd_signal', 'macd_hist', 'adx', 'adx_pos', 'adx_neg',
             'cci', 'mfi', 'nvi', 'obv', 'vpt', 'stoch_rsi','bb_width',
             'adi', 'cmf', 'emv', 'fi', 'williams', 'stoch','sma_crossover',
-            'volatility','daily_return','cumulative_return', 'roc','avg_volume_30d',
+            'volatility','daily_return','cumulative_return', 'roc','avg_volume',
             'rolling_rsi','rolling_stoch_rsi', 'ema_crossover','ichimoku_a','ichimoku_b',
-            'atr','kama','rocr','ppo','volatility_ratio','vwap','tii','fdi','fisher'
+            'atr','kama','rocr','ppo','volatility_ratio','vwap','tii','fdi','drawdown',
+            'volume_change'
         ]
 
         # Match each combined data entry with the closest available stock price in df
@@ -230,6 +223,7 @@ async def download_data(ticker, con, start_date, end_date):
         # Convert combined data into a DataFrame
         df_combined = pd.DataFrame(combined_data).dropna()
 
+        
         key_elements = [
             'revenue',
             'costOfRevenue',
@@ -242,7 +236,6 @@ async def download_data(ticker, con, start_date, end_date):
             'freeCashFlow',
             'incomeBeforeTax',
             'incomeTaxExpense',
-            'epsdiluted',
             'debtRepayment',
             'dividendsPaid',
             'depreciationAndAmortization',
@@ -275,37 +268,31 @@ async def download_data(ticker, con, start_date, end_date):
             'propertyPlantEquipmentNet',
             'ownersEarnings',
         ]
-
         # Compute ratios for all combinations of key elements
-        
+
+        new_columns = {}
+
+        # Loop over combinations of column pairs
         for num, denom in combinations(key_elements, 2):
-            # Compute ratio num/denom
+            # Compute ratio and reverse ratio
+            ratio = df_combined[num] / df_combined[denom]
+            reverse_ratio = df_combined[denom] / df_combined[num]
+
+            # Define column names for both ratios
             column_name = f'{num}_to_{denom}'
-            try:
-                ratio = df_combined[num] / df_combined[denom]
-                # Check for valid ratio
-                df_combined[column_name] = np.where((ratio != 0) & 
-                                                     (ratio != np.inf) & 
-                                                     (ratio != -np.inf) & 
-                                                     (~np.isnan(ratio)), 
-                                                     ratio, 0)
-            except Exception as e:
-                print(f"Error calculating {column_name}: {e}")
-                df_combined[column_name] = 0
-            
-            # Compute reverse ratio denom/num
             reverse_column_name = f'{denom}_to_{num}'
-            try:
-                reverse_ratio = df_combined[denom] / df_combined[num]
-                # Check for valid reverse ratio
-                df_combined[reverse_column_name] = np.where((reverse_ratio != 0) & 
-                                                             (reverse_ratio != np.inf) & 
-                                                             (reverse_ratio != -np.inf) & 
-                                                             (~np.isnan(reverse_ratio)), 
-                                                             reverse_ratio, 0)
-            except Exception as e:
-                print(f"Error calculating {reverse_column_name}: {e}")
-                df_combined[reverse_column_name] = 0
+
+            # Store the new columns in the dictionary, replacing invalid values with 0
+            new_columns[column_name] = np.nan_to_num(ratio, nan=0, posinf=0, neginf=0)
+            new_columns[reverse_column_name] = np.nan_to_num(reverse_ratio, nan=0, posinf=0, neginf=0)
+
+        # Add all new columns to the original DataFrame at once
+        df_combined = pd.concat([df_combined, pd.DataFrame(new_columns)], axis=1)
+        
+
+        # To defragment the DataFrame, make a copy
+        df_combined = df_combined.copy()
+
         
         # Create 'Target' column based on price change
         df_combined['Target'] = ((df_combined['price'].shift(-1) - df_combined['price']) / df_combined['price'] > 0).astype(int)
@@ -314,7 +301,7 @@ async def download_data(ticker, con, start_date, end_date):
         df_combined = df_combined.dropna()
         df_combined = df_combined.where(~df_combined.isin([np.inf, -np.inf]), 0)
         df_copy = df_combined.copy()
-        #print(df_copy[['date','revenue','ownersEarnings','revenuePerShare']])
+
         return df_copy
 
     except Exception as e:
@@ -322,123 +309,126 @@ async def download_data(ticker, con, start_date, end_date):
         pass
 
 
-async def process_symbol(ticker, con, start_date, end_date):
-    try:
-        test_size = 0.2
-        start_date = datetime(1995, 1, 1).strftime("%Y-%m-%d")
-        end_date = datetime.today().strftime("%Y-%m-%d")
-        predictor = FundamentalPredictor()
-        df = await download_data(ticker, con, start_date, end_date)
-        split_size = int(len(df) * (1-test_size))
-        test_data = df.iloc[split_size:]
-        best_features = [col for col in df.columns if col not in ['date','price','Target']]
-        data, prediction_list = predictor.evaluate_model(test_data[best_features], test_data['Target'])
-        
-
-        '''
-        output_list = [{'date': date, 'price': price, 'prediction': prediction, 'target': target} 
-                                for (date, price,target), prediction in zip(test_data[['date', 'price','Target']].iloc[-6:].values, prediction_list[-6:])]
-        '''
-        #print(output_list)
-
-        if len(data) != 0:
-            if data['precision'] >= 50 and data['accuracy'] >= 50:
-                await save_json(ticker, data)
+async def chunked_gather(tickers, con, start_date, end_date, chunk_size=10):
+    # Helper function to divide the tickers into chunks
+    def chunks(lst, size):
+        for i in range(0, len(lst), size):
+            yield lst[i:i+size]
     
-    except Exception as e:
-        print(e)
+    results = []
+    
+    for chunk in chunks(tickers, chunk_size):
+        # Create tasks for each chunk
+        tasks = [download_data(ticker, con, start_date, end_date) for ticker in chunk]
+        # Await the results for the current chunk
+        chunk_results = await asyncio.gather(*tasks)
+        # Accumulate the results
+        results.extend(chunk_results)
+    
+    return results
 
 
-#Train mode
-async def train_process(tickers, con):
-    tickers = list(set(tickers))
-    df_train = pd.DataFrame()
-    df_test = pd.DataFrame()
-    test_size = 0.2
+
+async def warm_start_training(tickers, con):
     start_date = datetime(1995, 1, 1).strftime("%Y-%m-%d")
     end_date = datetime.today().strftime("%Y-%m-%d")
     df_train = pd.DataFrame()
     df_test = pd.DataFrame()
+    test_size = 0.2
 
-    tasks = [download_data(ticker, con, start_date, end_date) for ticker in tickers]
-    dfs = await asyncio.gather(*tasks)
+    dfs = await chunked_gather(tickers, con, start_date, end_date, chunk_size=10)
+
+    train_list = []
+    test_list = []
+
     for df in dfs:
         try:
-            split_size = int(len(df) * (1-test_size))
+            split_size = int(len(df) * (1 - test_size))
             train_data = df.iloc[:split_size]
             test_data = df.iloc[split_size:]
-            df_train = pd.concat([df_train, train_data], ignore_index=True)
-            df_test = pd.concat([df_test, test_data], ignore_index=True)
+            
+            # Append to the lists
+            train_list.append(train_data)
+            test_list.append(test_data)
         except:
             pass
 
+    # Concatenate all at once outside the loop
+    df_train = pd.concat(train_list, ignore_index=True)
+    df_test = pd.concat(test_list, ignore_index=True)
     
-    best_features = [col for col in df_train.columns if col not in ['date','price','Target']]
-
+    print('======Warm Start Train Set Datapoints======')
     df_train = df_train.sample(frac=1).reset_index(drop=True) #df_train.reset_index(drop=True)
-    print(df_train)
-    print('======Train Set Datapoints======')
     print(len(df_train))
+    
+    predictor = ScorePredictor()
+    selected_features = [col for col in df_train if col not in ['price', 'date', 'Target']]
+    predictor.warm_start_training(df_train[selected_features], df_train['Target'])
+    predictor.evaluate_model(df_test[selected_features], df_test['Target'])
 
-    predictor = FundamentalPredictor()
-    #print(selected_features)
-    selected_features = [col for col in df_train if col not in ['price','date','Target']]
-    best_features = predictor.feature_selection(df_train[selected_features], df_train['Target'],k=100)
-    print(best_features)
-    predictor.train_model(df_train[best_features], df_train['Target'])
-    predictor.evaluate_model(df_test[best_features], df_test['Target'])
+    return predictor
 
-async def test_process(con):
-    test_size = 0.2
-    start_date = datetime(1995, 1, 1).strftime("%Y-%m-%d")
-    end_date = datetime.today().strftime("%Y-%m-%d")
-    predictor = FundamentalPredictor()
-    df = await download_data('GME', con, start_date, end_date)
-    split_size = int(len(df) * (1-test_size))
-    test_data = df.iloc[split_size:]
-    selected_features = [col for col in test_data if col not in ['price','date','Target']]
-    predictor.evaluate_model(test_data[selected_features], test_data['Target'])
-
+async def fine_tune_and_evaluate(ticker, con, start_date, end_date):
+    try:
+        df = await download_data(ticker, con, start_date, end_date)
+        if df is None or len(df) == 0:
+            print(f"No data available for {ticker}")
+            return
+        
+        test_size = 0.2
+        split_size = int(len(df) * (1-test_size))
+        train_data = df.iloc[:split_size]
+        test_data = df.iloc[split_size:]
+        
+        selected_features = [col for col in df.columns if col not in ['date','price','Target']]
+        # Fine-tune the model
+        predictor = ScorePredictor()
+        predictor.fine_tune_model(train_data[selected_features], train_data['Target'])
+        
+        print(f"Evaluating fine-tuned model for {ticker}")
+        data = predictor.evaluate_model(test_data[selected_features], test_data['Target'])
+        
+        if len(data) != 0:
+            if data['precision'] >= 50 and data['accuracy'] >= 50 and data['accuracy'] < 100 and data['precision'] < 100:
+                res = {'score': data['score']}
+                await save_json(ticker, res)
+                print(f"Saved results for {ticker}")
+        gc.collect()
+    except Exception as e:
+        print(f"Error processing {ticker}: {e}")
+    finally:
+        # Ensure any remaining cleanup if necessary
+        if 'predictor' in locals():
+            del predictor  # Explicitly delete the predictor to aid garbage collection
 
 async def run():
-
-    #Train first model
-    
+    train_mode = False  # Set this to False for fine-tuning and evaluation
     con = sqlite3.connect('stocks.db')
-
     cursor = con.cursor()
     cursor.execute("PRAGMA journal_mode = wal")
-    cursor.execute("SELECT DISTINCT symbol FROM stocks WHERE marketCap >= 10E9 AND symbol NOT LIKE '%.%'")
-    stock_symbols = [row[0] for row in cursor.fetchall()] #['AAPL','GME','LLY','NVDA'] #
-    print('Number of Stocks')
-    print(len(stock_symbols))
-    await train_process(stock_symbols, con)
-
-
-    #Prediction Steps for all stock symbols
-    '''
-    cursor.execute("SELECT DISTINCT symbol FROM stocks WHERE marketCap >= 1E9")
-    stock_symbols = [row[0] for row in cursor.fetchall()]
-
-    total_symbols = ['GME'] #stock_symbols
     
-    print(f"Total tickers: {len(total_symbols)}")
-    start_date = datetime(2000, 1, 1).strftime("%Y-%m-%d")
-    end_date = datetime.today().strftime("%Y-%m-%d")
-
-    chunk_size = len(total_symbols)# // 100  # Divide the list into N chunks
-    chunks = [total_symbols[i:i + chunk_size] for i in range(0, len(total_symbols), chunk_size)]
-    for chunk in chunks:
+    if train_mode:
+        # Warm start training
+        cursor.execute("SELECT DISTINCT symbol FROM stocks WHERE marketCap >= 10E9 AND symbol NOT LIKE '%.%' AND symbol NOT LIKE '%-%'")
+        warm_start_symbols = [row[0] for row in cursor.fetchall()]
+        print('Warm Start Training for:', warm_start_symbols)
+        predictor = await warm_start_training(warm_start_symbols, con)
+    else:
+        # Fine-tuning and evaluation for all stocks
+        cursor.execute("SELECT DISTINCT symbol FROM stocks WHERE marketCap >= 1E9 AND symbol NOT LIKE '%.%'")
+        stock_symbols = [row[0] for row in cursor.fetchall()]
+        
+        print(f"Total tickers for fine-tuning: {len(stock_symbols)}")
+        start_date = datetime(1995, 1, 1).strftime("%Y-%m-%d")
+        end_date = datetime.today().strftime("%Y-%m-%d")
         tasks = []
-        for ticker in tqdm(chunk):
-            tasks.append(process_symbol(ticker, con, start_date, end_date))
-
-        await asyncio.gather(*tasks)
-    '''
+        for ticker in tqdm(stock_symbols):
+            await fine_tune_and_evaluate(ticker, con, start_date, end_date)
+            
     con.close()
-    
-try:
-    asyncio.run(run())
-except Exception as e:
-    print(e)
 
+if __name__ == "__main__":
+    try:
+        asyncio.run(run())
+    except Exception as e:
+        print(f"Main execution error: {e}")
